@@ -227,3 +227,142 @@ static int lept_parse_string(lept_context* c, lept_value* v) {
 -  在实现字符串时,作者用了堆栈来当缓冲区。这类模拟题写过很多了，无非就是手写栈来存储过程性的东西，选择栈是因为"先进后出"的需求。惊艳我的地方1.是扩展时每次以1.5倍而非2倍，并且很多STL源码都是这么设计的。2.是不明白为何"ret = c->stack + c->top;"此处可以直接拿stack和top相加?
   ```
 答：c->stack 和 c->top 的单位是一致的：c->stack 是一个 char*，单位是字节。c->top 是一个 size_t，也表示字节数，此时指针运算直接以字节为单位。c语言是支持对指针运算的。
+
+
+## Part4 
+### task
+```
+1.实现 lept_parse_hex4()，不合法的十六进位数返回 LEPT_PARSE_INVALID_UNICODE_HEX。
+2.按第 3 节谈到的 UTF-8 编码原理，实现 lept_encode_utf8()。这函数假设码点在正确范围 U+0000 ~ U+10FFFF（用断言检测）。
+3.加入对代理对的处理，不正确的代理对范围要返回 LEPT_PARSE_INVALID_UNICODE_SURROGATE 错误。
+```
+#### 1.
+我的写法较标答繁琐，先判后四位是否是十六进制位数再转换
+```cpp
+static const char* lept_parse_hex4(const char* p, unsigned* u) {
+    //如果 `\u` 后不是 4 位十六进位数字，则返回 `LEPT_PARSE_INVALID_UNICODE_HEX` 错误。
+    char* to = p;
+    int cntOfNumber = 0;
+    to++;
+    if (((*to) <= 'F' && (*to) >= 'A') || ((*to) <= '9' && (*to) >= '0') ||
+        ((*to) <= 'f' && (*to) >= 'a')) {
+        cntOfNumber++;
+        while (((*to) <= 'F' && (*to) >= 'A') || ((*to) <= '9' && (*to) >= '0') ||
+        ((*to) <= 'f' && (*to) >= 'a')){
+            to++;
+            cntOfNumber++;
+            if (cntOfNumber == 4) break;
+        }
+    }
+    if (cntOfNumber < 4) return NULL;
+    *u = 0;
+    for (int i = 0;i < 4;i++) {
+        *u <<= 4;
+        if ((*p) <= 'F' && (*p) >= 'A') {
+            *u += ((*p) - 'A') + 10;
+        }
+        else if ((*p) <= 'f' && (*p) >= 'a') {
+            *u += ((*p) - 'a') + 10;
+        }
+        else if ((*p) <= '9' && (*p) >= '0') {
+            *u += ((*p) - '0');
+        }
+        else {
+            return NULL;
+        }
+        p++;
+    }
+    return p;
+}
+```
+
+#### 2.
+只要把UTF-8的编码翻译出来就好，写代码时根据字节数声明了对应变量，这么做是为了方便自己调试。
+```
+static void lept_encode_utf8(lept_context* c, unsigned u) {
+    //把码点编码成 UTF-8，写进缓冲区
+    assert(u >= 0x0000 && u <= 0x10FFFF);
+    if (u >= 0x0000 && u <= 0x007F) {
+        unsigned bit1;
+        bit1 = u & 0xFF;
+        PUTC(c,bit1);
+    }
+    else if (u >= 0x0080 && u <= 0x07FF) {
+        unsigned bit1,bit2;
+        bit1 = (0xC0 | ((u >> 6) & 0xFF) );
+        bit2 = (0x80 | (u & 0x3F));
+        PUTC(c,bit1);
+        PUTC(c, bit2);
+    }
+    else if (u >= 0x0800 && u <= 0xFFFF) {
+        unsigned bit1, bit2, bit3;
+        bit1 = (0xE0 | ((u >> 12) & 0xFF));
+        bit2 = (0x80 | ((u >> 6) & 0x3F));
+        bit3 = (0x80 | (u & 0x3F));
+        PUTC(c, bit1);
+        PUTC(c, bit2);
+        PUTC(c, bit3);
+    }
+    else {
+        unsigned bit1, bit2, bit3,bit4;
+        bit1 = (0xF0 | ((u >> 18) & 0xFF));
+        bit2 = (0x80 | ((u >> 12) & 0x3F));
+        bit3 = (0x80 | ((u >> 6) & 0x3F));
+        bit4 = (0x80 | (u  & 0x3F));
+        PUTC(c, bit1);
+        PUTC(c, bit2);
+        PUTC(c, bit3);
+        PUTC(c, bit4);
+    }
+}
+```
+但此处有个困惑，为什么这里可以直接写入unsigned？PUT函数接受的不是char吗？以及lept_context_push()函数好像也没实际写入数据，只做了扩容，到底在哪完成的写入？
+答：
+```
+来看PUTC的宏定义：
+```cpp
+#define PUTC(c, ch)         do { *(char*)lept_context_push(c, sizeof(char)) = (ch); } while(0)
+```
+这里用了“解引用”将lept_context_push()传回的指针所指向的位置赋值成ch，lept_context_push()函数里并没有完成写入操作，只是扩容、返回指针。
+可以直接写入unsigned是因为C语言有隐式转换，可以将unsighed类型直接转为char，如果 unsigned 类型的值在 char 类型能表示的范围(有符号 char 是 -128 到 127，无符号 char 是 0 到 255)内，那会被正确转换，但可能会丢失超出 char 表示范围的高位数据(比如对于无符号 char，如果 unsigned 值大于 255，会只保留低 8 位)。
+```
+
+#### 3.
+代理对可以在完成一次lept_parse_hex4后检测，如果解析出来的数在[0xD800,0xDBFF]范围内，说明后面应该跟着\\uXXXX。
+逐个判断即可。
+```cpp
+case 'u':
+//codepoint = 0x10000 + (H − 0xD800) × 0x400 + (L − 0xDC00)
+    if (!(p = lept_parse_hex4(p, &u)))
+        STRING_ERROR(LEPT_PARSE_INVALID_UNICODE_HEX);
+    if (u >= 0xD800 && u <= 0xDBFF) {
+        if (*p != '\\') return LEPT_PARSE_INVALID_UNICODE_SURROGATE;
+        p++;
+        if (*p != 'u') return LEPT_PARSE_INVALID_UNICODE_SURROGATE;
+        p++;
+        unsigned uLow;
+        if (!(p = lept_parse_hex4(p, &uLow)))
+            STRING_ERROR(LEPT_PARSE_INVALID_UNICODE_HEX);
+        if (uLow > 0xDFFF || uLow < 0xDC00) return LEPT_PARSE_INVALID_UNICODE_SURROGATE;
+        unsigned codePoint;
+        codePoint = 0x10000 + (u - 0xD800) * 0x400 + (uLow - 0xDC00);
+        lept_encode_utf8(c, codePoint);
+    }
+    else lept_encode_utf8(c, u);
+    break;
+default:
+    STRING_ERROR(LEPT_PARSE_INVALID_STRING_ESCAPE);
+```
+#### 学习笔记
+了解了码点、UTF-8的编码原理，印象最深的是代理对和字节序。
+代理对原理:
+```
+正常来说如果用一个数字表示一个码点的话，能表示的数目就是O(n)的，但需要用少量的数字范围表示更多的码点，且同时
+保留低位和ASCII码一致时，就可以选择开辟部分区间作为特别的"入口"，从这里出发，后面再跟着一个数字，就能用原先的
+范围表示o(n^2)的数据，非常巧妙的代理对。
+```
+字节序原理：
+```
+UTF-8之所以通用的另一个原因是UTF - 8 不存在字节序的概念。它不是像 UTF - 16/32 那样将一个字符的编码均匀分布在固定长度的多个字节中，且字节顺序可能会变化。组成原理里有大端、小端的概念：这好比编程语言里面的阅读顺序，我们读现代文是从左往右，读古文时是从右往左，那编译时放在大端的到底是低位还是高位？还好UTF-8没有这种困扰，它的编码是从高位到低位依次分布在字节中的。
+```
+
