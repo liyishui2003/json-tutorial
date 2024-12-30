@@ -236,6 +236,7 @@ static int lept_parse_string(lept_context* c, lept_value* v) {
 2.按第 3 节谈到的 UTF-8 编码原理，实现 lept_encode_utf8()。这函数假设码点在正确范围 U+0000 ~ U+10FFFF（用断言检测）。
 3.加入对代理对的处理，不正确的代理对范围要返回 LEPT_PARSE_INVALID_UNICODE_SURROGATE 错误。
 ```
+
 #### 1.
 我的写法较标答繁琐，先判后四位是否是十六进制位数再转换
 ```cpp
@@ -319,10 +320,7 @@ static void lept_encode_utf8(lept_context* c, unsigned u) {
 但此处有个困惑，为什么这里可以直接写入unsigned？PUT函数接受的不是char吗？以及lept_context_push()函数好像也没实际写入数据，只做了扩容，到底在哪完成的写入？
 答：
 ```
-来看PUTC的宏定义：
-```cpp
-#define PUTC(c, ch)         do { *(char*)lept_context_push(c, sizeof(char)) = (ch); } while(0)
-```
+来看PUTC的宏定义：#define PUTC(c, ch)         do { *(char*)lept_context_push(c, sizeof(char)) = (ch); } while(0)
 这里用了“解引用”将lept_context_push()传回的指针所指向的位置赋值成ch，lept_context_push()函数里并没有完成写入操作，只是扩容、返回指针。
 可以直接写入unsigned是因为C语言有隐式转换，可以将unsighed类型直接转为char，如果 unsigned 类型的值在 char 类型能表示的范围(有符号 char 是 -128 到 127，无符号 char 是 0 到 255)内，那会被正确转换，但可能会丢失超出 char 表示范围的高位数据(比如对于无符号 char，如果 unsigned 值大于 255，会只保留低 8 位)。
 ```
