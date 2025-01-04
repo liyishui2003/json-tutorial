@@ -415,3 +415,168 @@ union 的特点是其内部所有成员共用同一块内存空间
 ...
 #endif
 ```
+ 
+### task
+```
+1.编写 test_parse_array() 单元测试，解析以下 2 个 JSON。由于数组是复合的类型，不能使用一个宏去测试结果，请使用各个 API 检查解析后的内容。
+2.现时的测试结果应该是失败的，因为 lept_parse_array() 里没有处理空白字符，加进合适的 lept_parse_whitespace() 令测试通过。
+3.使用第三单元解答篇介绍的检测内存泄漏工具，会发现测试中有内存泄漏。很明显在 lept_parse_array() 中使用到 malloc() 分配内存，但却没有对应的 free()。应该在哪里释放内存？修改代码，使工具不再检测到相关的内存泄漏。
+4.开启 test.c 中两处被 #if 0 ... #endif 关闭的测试，本来 lept_parse_array() 已经能处理这些测试。然而，运行时会发现 Assertion failed: (c.top == 0) 断言失败。这是由于，当错误发生时，仍然有一些临时值在堆栈里，既没有放进数组，也没有被释放。修改 lept_parse_array()，当遇到错误时，从堆栈中弹出并释放那些临时值，然后才返回错误码。
+5.第 4 节那段代码为什么会有 bug？
+```
+#### 1.
+起初没懂"调用api"，看了下标程，才知道是调access类的函数检查返回了什么，再用宏去检测是否与预期的一致
+```cpp
+static void test_parse_array() {
+    lept_value v;
+    lept_init(&v);
+    EXPECT_EQ_INT(LEPT_PARSE_OK, lept_parse(&v, "[ ]"));
+    EXPECT_EQ_INT(LEPT_ARRAY, lept_get_type(&v));
+    EXPECT_EQ_SIZE_T(0, lept_get_array_size(&v));
+    lept_free(&v);
+   
+    lept_init(&v);
+    EXPECT_EQ_INT(LEPT_PARSE_OK, lept_parse(&v, "[ null , false , true , 123 , \"abc\" ]"));
+    EXPECT_EQ_INT(LEPT_ARRAY, lept_get_type(&v));
+    EXPECT_EQ_SIZE_T(5, lept_get_array_size(&v));
+    EXPECT_EQ_INT(LEPT_NULL, lept_get_type(lept_get_array_element(&v,0)));
+    EXPECT_EQ_INT(LEPT_FALSE, lept_get_type(lept_get_array_element(&v, 1)));
+    EXPECT_EQ_INT(LEPT_TRUE, lept_get_type(lept_get_array_element(&v, 2)));
+    EXPECT_EQ_INT(LEPT_NUMBER, lept_get_type(lept_get_array_element(&v, 3)));
+    EXPECT_EQ_INT(LEPT_STRING, lept_get_type(lept_get_array_element(&v, 4)));
+    EXPECT_EQ_STRING("abc", lept_get_string(lept_get_array_element(&v, 4)),3);
+    EXPECT_EQ_DOUBLE(123.0, lept_get_number(lept_get_array_element(&v, 3)));
+    lept_free(&v);
+    
+    lept_init(&v);
+    EXPECT_EQ_INT(LEPT_PARSE_OK, lept_parse(&v, "[ [ ] , [ 0 ] , [ 0 , 1 ] , [ 0 , 1 , 2 ] ]"));
+    EXPECT_EQ_INT(LEPT_ARRAY, lept_get_type(&v));
+    EXPECT_EQ_SIZE_T(4, lept_get_array_size(&v));
+    
+    _Bool checkFlag = 1;
+    for (int i = 0;i < 4;i++) {
+        lept_value* e=lept_get_array_element(&v,i);
+        EXPECT_EQ_INT(LEPT_ARRAY, lept_get_type(e));
+        if (lept_get_array_size(e) != i) {
+            checkFlag = 0;
+            break;
+        }
+        for (int j = 0;j < i;j++) {
+            int actualNumber = lept_get_number(lept_get_array_element(e, j));
+            if (actualNumber != j) checkFlag = 0;
+        }
+    }
+    EXPECT_EQ_INT(1, checkFlag);
+    lept_free(&v);
+    
+}
+```
+
+#### 2.
+```cpp
+static int lept_parse_array(lept_context* c, lept_value* v) {
+    size_t size = 0;
+    int ret;
+    EXPECT(c, '[');
+    //比如 [ abc , 123 ],"["后就有空格了
+    lept_parse_whitespace(c);
+    ...
+    for (;;) {
+        lept_value e;
+        lept_init(&e);
+        //比如 [ abc , 123 ],开始解析一个元素前会有空格
+        lept_parse_whitespace(c);
+        if ((ret = lept_parse_value(c, &e)) != LEPT_PARSE_OK) {
+            for (int i = 0; i < size; i++)
+                lept_free(lept_context_pop(c, sizeof(lept_value)));
+        // lept_context_pop(c, sizeof(lept_value) * size);
+            return ret;
+        }
+        // 比如 [ abc , 123 ],解析完一个元素后会有空格
+        lept_parse_whitespace(c);
+        memcpy(lept_context_push(c, sizeof(lept_value)), &e, sizeof(lept_value));
+        size++;
+        if (*c->json == ',')
+            c->json++,
+            //比如 [ abc , 123 ],逗号后也会有
+            lept_parse_whitespace(c);
+        ...
+}
+```
+#### 3.
+这问有意思，起初简单在lept_free里改动了：
+```cpp
+void lept_free(lept_value* v) {
+    assert(v != NULL);
+    if (v->type == LEPT_STRING)
+        free(v->u.s.s);
+    if (v->type == LEPT_ARRAY) {
+        free(v->u.a.e);
+    }
+    v->type = LEPT_NULL;
+}
+```
+还是泄漏，发现把新增的两个复杂样例删去就没有了，说明是能free的，但解决不了多个、嵌套多层的情况，猜测要用dfs手动释放。
+写个递归即可：
+```cpp
+void lept_free(lept_value* v) {
+    assert(v != NULL);
+    if (v->type == LEPT_STRING)
+        free(v->u.s.s);
+    // 想清楚它是用链表形式(有很多的next)还是数组形式
+    // 实质上构成一棵树，每个节点都是一个指针数组
+    if (v->type == LEPT_ARRAY) {
+        size_t sizeOfArray = lept_get_array_size(v);//这里和直接用v->u.a.size是一样的
+        for (int i = 0;i < sizeOfArray;i++) {
+            lept_free(&(v->u.a.e[i]));
+        }
+        free(v->u.a.e);
+    }
+    v->type = LEPT_NULL;
+}
+```
+这里有多处free，注意free传入的是指针，所以释放叶子节点时直接用 v->u.a.e 或者 v->u.s.s 即可，但递归去下一层时，应该对数组里的元素取地址。
+
+#### 4.
+```cpp
+static int lept_parse_array(lept_context* c, lept_value* v) {
+
+    ......
+    
+    for (;;) {
+        lept_value e;
+        lept_init(&e);
+        lept_parse_whitespace(c);
+        if ((ret = lept_parse_value(c, &e)) != LEPT_PARSE_OK) {
+            for (int i = 0; i < size; i++)
+                lept_free(lept_context_pop(c, sizeof(lept_value)));
+            return ret;
+        }
+        ......
+        else {
+        // pop what?
+        // 不是size,显然size并不等同于缓冲区大小，还和占多少字节有关系，毕竟堆栈其实是按字节算的
+        // 是sizeof(lept_value))，但不能只pop一次，应该重复做size次
+        // 所以可以for一遍，也可以直接算出一共需要pop多少
+        // 法一：for一遍
+            for (int i = 0; i < size; i++)
+                lept_free(lept_context_pop(c, sizeof(lept_value)));
+        // 法二：直接算    
+        // lept_context_pop(c, sizeof(lept_value)*size);
+        // 法一和法二的共性在于都能改变c.top的值,使得代码通过测试
+        // 但直接算的话就没法逐个手动free，经crt工具测试，会导致内存泄漏，所以手动循环更优
+            return LEPT_PARSE_MISS_COMMA_OR_SQUARE_BRACKET;
+        }
+    }
+}
+```
+
+#### 5.
+Q:第 4 节那段代码为什么会有 bug？
+A：用指针去获取空间时，如果能直接写入数据倒还好，但如果在写入数据前调用了realloc()等可能会使当前指针地址失效的函数，
+就会出现"悬空指针"问题，即：地址还是那个地址，但已经没有意义了。
+为什么realloc()会导致失效？realloc的原理是能扩展时直接往下扩展，不能扩展的话另找一块足够的内存把数据复制过去，并扩展。
+那么，当空间不够时，所有数据就会搬到另外一个地址去，此时再往指针指向的地方写入数据就没意义了————它既不是连续的，我们也
+无法从某个数组的首地址出发去访问到它。
+总结：注意指针的生命周期。
+
