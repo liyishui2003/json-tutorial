@@ -582,3 +582,102 @@ A：用指针去获取空间时，如果能直接写入数据倒还好，但如�
 
 总结：注意指针的生命周期。
 
+## Part6
+#### 学习笔记.
+Q:lept_parse_string_raw(lept_context* c, char** str, size_t* len)
+为什么重构时要用二级指针？
+A：
+```
+函数的传递参数机制。如果只传char* str，收到的是该变量的副本，而不是变量本身。
+但传递指针的地址(二级指针char**)就可以通过解引用操作（*str）来修改原始指针的值。
+```
+
+Q:为什么涉及到从"缓冲区搬运东西"、"写入结构体"等操作时，都用memcpy而非简单的指针赋值？比如
+```
+size_t s = sizeof(lept_member) * size;
+memcpy(v->u.o.m = (lept_member*)malloc(s), lept_context_pop(c, s), s);
+```
+A：
+```
+1.简单的指针赋值不能真正写入数据，而memcpy可以处理任意类型的数据(基本数据类型、结构体、数组)。
+它可以将这些数据从一个内存位置复制到另一个内存位置，实现数据的完整复制。
+2.简单的指针赋值会导致指针指向同一块内存，一切会很混乱
+```
+
+Q:以下代码为什么要引入lept_member m?
+```
+static int lept_parse_object(lept_context* c, lept_value* v) {
+    size_t i, size = 0;
+    lept_member m;
+    ...
+    m.k = NULL;
+    for (;;) {
+        ...
+        lept_init(&m.v);
+        ...
+        if ((ret = lept_parse_string_raw(c, &str, &m.klen)) != LEPT_PARSE_OK)
+            break;
+        memcpy(m.k = (char*)malloc(m.klen + 1), str, m.klen);
+        m.k[m.klen] = '\0';
+        ...
+        if ((ret = lept_parse_value(c, &m.v)) != LEPT_PARSE_OK)
+            break;
+        memcpy(lept_context_push(c, sizeof(lept_member)), &m, sizeof(lept_member));
+        ...
+        m.k = NULL; 
+        ...
+        if (*c->json == '}') {
+            size_t s = sizeof(lept_member) * size;
+            memcpy(v->u.o.m = (lept_member*)malloc(s), lept_context_pop(c, s), s);
+        }
+        ...
+    }
+    free(m.k);
+    for (i = 0;i < size;i++) {
+        lept_member* m = lept_context_pop(c, sizeof(lept_member));
+        free(m->k);
+        //此处传给lept_free的是指针，应该对m->v取地址。
+        lept_free(&(m->v));
+    }
+}
+```
+A：
+```
+一般引入中间变量都是为了方便。
+1.起到集成的作用，复制数据、清理内存都只要关心m就好，因为它集成了这些信息。
+2.封装起来方便单独处理每个成员，否则可能需引入计数器啥的。
+```
+
+Q:什么时候用 -> 什么时候用 . ？
+A:
+```
+结构体或类的实例对象，用 . 来访问其成员。
+指向结构体或类的指针，用 -> 运算符来访问指针所指向对象的成员。
+并且其实->是(*指针).成员的简写形式。
+```
+
+Q:
+没看到有声明数组，只有指针啊，为什么可以用 m[i] 来访问？比如：
+```
+void lept_free(lept_value* v) {
+    size_t i;
+    assert(v != NULL);
+    switch (v->type) {
+        ......
+        case LEPT_OBJECT:
+            for (i = 0;i < v->u.o.size;i++) {
+                lept_free(&((v->u.o.m[i]).v));
+                free((v->u.o.m[i]).k);
+            }
+    }
+}
+```
+
+A:
+```
+malloc分配指定大小的连续内存块。当分配的内存大小是某个结构体类型大小的整数倍时，这块内存就可看作该结构体类的数组。
+数组名在大多数表达式中会被隐式转换为指向数组首元素的指针。
+同样，当指针指向一块连续的内存，且这块内存可看作数组时，就能用数组下标运算符 [] 来访问。
+所以看起来是指针，但用了malloc，实际上指向的是数组。
+```
+
